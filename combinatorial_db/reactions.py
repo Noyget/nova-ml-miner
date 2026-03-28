@@ -142,7 +142,11 @@ def perform_smarts_reaction(smiles1: str, smiles2: str, smarts: str) -> str:
         return Chem.MolToSmiles(products[0][0]) if products else None
         
     except Exception as e:
-        bt.logging.error(f"Error in SMARTS reaction: {e}")
+        # Suppress verbose SMARTS error logging — too many bad reactions in DB
+        # Only log once per session to avoid memory exhaustion
+        if not hasattr(perform_smarts_reaction, '_logged_error'):
+            bt.logging.warning(f"[SMARTS] Encountered bad reactions; suppressing further logs")
+            perform_smarts_reaction._logged_error = True
         return None
 
 

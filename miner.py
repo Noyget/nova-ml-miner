@@ -11,6 +11,12 @@ import json
 import resource
 import psutil
 import gc
+import logging
+
+# Disable Bittensor's verbose multiprocessing logging queue
+# This prevents memory exhaustion from log queue buildup
+logging.getLogger("bittensor").setLevel(logging.WARNING)
+os.environ['BT_LOGGING_HANDLER'] = 'off'
 
 # Add neurons dir to path so we can import modules
 BASE_DIR = os.path.dirname(__file__)

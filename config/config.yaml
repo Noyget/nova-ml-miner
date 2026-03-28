@@ -2,6 +2,9 @@
 protein_selection:
   num_antitargets: 2
 
+# PSICHIC scoring enabled (for mainnet testing)
+enable_scoring: true
+
 # Parameters for validating and scoring molecules
 molecule_validation:
   # Scoring weights for target/antitarget binding
