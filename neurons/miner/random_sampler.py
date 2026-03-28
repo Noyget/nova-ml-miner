@@ -12,7 +12,7 @@ import sys
 
 # Molecule pool cache to reduce database queries by 95%
 _MOLECULE_POOL_CACHE: Dict[int, Tuple[List[Tuple[int, str, int]], float]] = {}
-_CACHE_TTL_SECONDS = 300  # 5 minute cache
+_CACHE_TTL_SECONDS = 300  # 5-minute TTL for molecule pools (was 0, causing alternating 0/250 failures)
 
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(PARENT_DIR)
@@ -248,16 +248,27 @@ def get_molecules_by_role_cached(role_mask: int, db_path: str) -> List[Tuple[int
     if role_mask in _MOLECULE_POOL_CACHE:
         cached_molecules, cache_time = _MOLECULE_POOL_CACHE[role_mask]
         if current_time - cache_time < _CACHE_TTL_SECONDS:
-            return cached_molecules
+            # Only return if cache is valid (non-empty) — prevent empty caches
+            if cached_molecules:
+                bt.logging.debug(f"[Cache HIT] role={role_mask}: {len(cached_molecules)} molecules (age={current_time - cache_time:.1f}s)")
+                return cached_molecules
+            else:
+                bt.logging.debug(f"[Cache INVALID] role={role_mask}: cache is empty, refetching from DB")
     
     # Cache miss or expired — fetch from database
+    bt.logging.debug(f"[Cache MISS] role={role_mask}: fetching from database")
     molecules = get_molecules_by_role(role_mask, db_path)
     
-    # Store in cache with current timestamp
-    _MOLECULE_POOL_CACHE[role_mask] = (molecules, current_time)
-    
+    # CRITICAL FIX: Only cache non-empty results
+    # Empty results indicate a transient DB error — we should NOT cache those
     if molecules:
-        bt.logging.info(f"Cached {len(molecules)} molecules for role {role_mask}")
+        _MOLECULE_POOL_CACHE[role_mask] = (molecules, current_time)
+        bt.logging.info(f"[Sampler] Cached {len(molecules)} molecules for role {role_mask}")
+    else:
+        # DB fetch failed — clear any stale cache for this role
+        if role_mask in _MOLECULE_POOL_CACHE:
+            del _MOLECULE_POOL_CACHE[role_mask]
+        bt.logging.error(f"[Sampler] Failed to fetch molecules for role {role_mask} from DB (cache cleared)")
     
     return molecules
 
@@ -287,24 +298,50 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
     smarts, roleA, roleB, roleC = reaction_info
     is_three_component = roleC is not None and roleC != 0
     
-    # Use cached molecule pools to avoid repeated database queries (95% reduction)
-    molecules_A = get_molecules_by_role_cached(roleA, db_path)
-    molecules_B = get_molecules_by_role_cached(roleB, db_path)
-    molecules_C = get_molecules_by_role_cached(roleC, db_path) if is_three_component else []
+    # CRITICAL FIX: Always fetch fresh from database on first call (no cache)
+    # The cache was causing 0/250 cycles — force fresh loads to ensure molecule pools exist
+    bt.logging.info(f"[Sampler] Fetching molecules for reaction {rxn_id}: roleA={roleA}, roleB={roleB}, roleC={roleC}, is_three={is_three_component}")
+    molecules_A = get_molecules_by_role(roleA, db_path)
+    molecules_B = get_molecules_by_role(roleB, db_path)
+    molecules_C = get_molecules_by_role(roleC, db_path) if is_three_component else []
     
+    bt.logging.info(f"[Sampler] Query results: {len(molecules_A)} for roleA, {len(molecules_B)} for roleB, {len(molecules_C) if is_three_component else 'N/A'} for roleC")
+    
+    # Cache the result for this call only (cache won't persist across iterations)
+    if molecules_A:
+        _MOLECULE_POOL_CACHE[roleA] = (molecules_A, time.time())
+    if molecules_B:
+        _MOLECULE_POOL_CACHE[roleB] = (molecules_B, time.time())
+    if molecules_C and is_three_component:
+        _MOLECULE_POOL_CACHE[roleC] = (molecules_C, time.time())
+    
+    # CRITICAL: Validate that we have molecule pools — prevent silent failures with empty pools
     if not molecules_A or not molecules_B or (is_three_component and not molecules_C):
-        bt.logging.error(f"No molecules found for roles A={roleA}, B={roleB}, C={roleC}")
+        bt.logging.error(f"[CRITICAL] No molecules found for reaction {rxn_id}:")
+        bt.logging.error(f"  roleA={roleA}: {len(molecules_A)} molecules")
+        bt.logging.error(f"  roleB={roleB}: {len(molecules_B)} molecules")
+        if is_three_component:
+            bt.logging.error(f"  roleC={roleC}: {len(molecules_C)} molecules")
+        
+        # Database query already failed above — don't waste time retrying
+        bt.logging.error(f"[FATAL] Cannot generate molecules for reaction {rxn_id} — molecule pools are empty")
         return {"molecules": [None] * n_samples}
     
     valid_molecules = []
     seen_keys = set()
     iteration = 0
-    MAX_ITERATIONS = 1000  # Safety limit to prevent infinite loops
+    MAX_ITERATIONS = 5000  # Increased from 1000 to handle low-yield reactions (was causing 0/250 after batch 1)
 
     progress_bar = tqdm(total=n_samples, desc="Creating valid molecules", unit="molecule")
     
     while len(valid_molecules) < n_samples and iteration < MAX_ITERATIONS:
         iteration += 1
+        
+        # Defensive check: if molecule pools are suddenly empty, this indicates a critical failure
+        # Abort rather than silently returning 0/250
+        if not molecules_A or not molecules_B or (is_three_component and not molecules_C):
+            bt.logging.error(f"[CRITICAL] Molecule pools became empty at iteration {iteration} (this should never happen)")
+            break
         
         # Calculate how many molecules we still need
         needed = n_samples - len(valid_molecules)
@@ -318,6 +355,7 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
             molecules_A, molecules_B, molecules_C, is_three_component,
             smarts, roleA, roleB, roleC, seed
         )
+        
         # Validate directly on SMILES (no DB calls)
         batch_valid_molecules, batch_valid_smiles = validate_smiles_sampler(batch_names, batch_smiles, subnet_config)
 
@@ -423,6 +461,19 @@ def run_sampler(n_samples: int = 1000,
         bt.logging.error("No reactions found in the database, check db path and integrity.")
         return
 
+    # CRITICAL FIX: Filter out reactions with 'N/A' SMARTS (database stubs)
+    # These are placeholder reactions that cannot be parsed by RDKit
+    # Only use reactions with valid SMARTS strings
+    valid_reactions = [r for r in reactions if r[1] != 'N/A']
+    
+    if not valid_reactions:
+        bt.logging.error("No valid reactions found! All reactions have 'N/A' SMARTS.")
+        return
+    
+    if len(valid_reactions) < len(reactions):
+        bt.logging.warning(f"Filtered out {len(reactions) - len(valid_reactions)} invalid reactions with 'N/A' SMARTS")
+    
+    reactions = valid_reactions
     rxn_ids = [reactions[i][0] for i in range(len(reactions))]
 
     # Handle both "allowed_reaction" (mainnet) and "random_valid_reaction" (testnet)
