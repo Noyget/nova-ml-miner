@@ -116,7 +116,15 @@ def iterative_sampling_loop(
         # Skip scoring if module not loaded (testnet mode)
         if not _scoring_loaded:
             bt.logging.warning("[Miner] Scoring module not available; using default scores")
-            score_dict = {name: 0.5 for name in sampler_data.get("molecules", [])}
+            # Create a fallback score_dict in the expected format for calculate_final_scores()
+            # Expected format: [{"ps_target_scores": [...], "ps_antitarget_scores": [...]}]
+            num_molecules = len(sampler_data.get("molecules", []))
+            num_targets = len(config.get("target_sequences", {}))
+            num_antitargets = len(config.get("antitarget_sequences", {}))
+            score_dict = [{
+                "ps_target_scores": [[0.5] * num_molecules] * num_targets,
+                "ps_antitarget_scores": [[0.5] * num_molecules] * num_antitargets
+            }]
         else:
             from validator.scoring import score_molecules_json
             score_dict = score_molecules_json(sampler_file_path, 
@@ -124,9 +132,15 @@ def iterative_sampling_loop(
                                              list(config["antitarget_sequences"].keys()), 
                                              config)
         
-        if not score_dict:
+        if not score_dict or (isinstance(score_dict, list) and len(score_dict) == 0):
             bt.logging.warning("[Miner] Scoring failed or mismatched; continuing")
             continue
+        
+        # Verify score_dict has expected structure
+        if isinstance(score_dict, list) and len(score_dict) > 0:
+            if 'ps_target_scores' not in score_dict[0]:
+                bt.logging.warning("[Miner] Score dict missing ps_target_scores; continuing")
+                continue
 
         # Calculate final scores per molecule
         batch_scores = calculate_final_scores(score_dict, sampler_data, config, save_all_scores, iteration)
@@ -198,21 +212,28 @@ def calculate_final_scores(score_dict: dict,
             inchikey_list.append(None)
 
     # Calculate final scores for each molecule
-    targets = score_dict[0]['ps_target_scores']
-    antitargets = score_dict[0]['ps_antitarget_scores']
-    final_scores = []
-    for mol_idx in range(len(names)):
-        # target average
-        target_scores_for_mol = [target_list[mol_idx] for target_list in targets]
-        avg_target = sum(target_scores_for_mol) / len(target_scores_for_mol)
+    # Fallback to default scores if scoring is disabled or score_dict is empty
+    if score_dict and len(score_dict) > 0:
+        targets = score_dict[0]['ps_target_scores']
+        antitargets = score_dict[0]['ps_antitarget_scores']
+        final_scores = []
+        for mol_idx in range(len(names)):
+            # target average
+            target_scores_for_mol = [target_list[mol_idx] for target_list in targets]
+            avg_target = sum(target_scores_for_mol) / len(target_scores_for_mol)
 
-        # antitarget average
-        antitarget_scores_for_mol = [antitarget_list[mol_idx] for antitarget_list in antitargets]
-        avg_antitarget = sum(antitarget_scores_for_mol) / len(antitarget_scores_for_mol)
+            # antitarget average
+            antitarget_scores_for_mol = [antitarget_list[mol_idx] for antitarget_list in antitargets]
+            avg_antitarget = sum(antitarget_scores_for_mol) / len(antitarget_scores_for_mol)
 
-        # final score
-        score = avg_target - (config["antitarget_weight"] * avg_antitarget)
-        final_scores.append(score)
+            # final score
+            score = avg_target - (config["antitarget_weight"] * avg_antitarget)
+            final_scores.append(score)
+    else:
+        # Fallback: use random scores when scoring is disabled
+        import random
+        final_scores = [random.random() for _ in range(len(names))]
+        bt.logging.info(f"Scoring disabled or empty; using fallback random scores for {len(names)} molecules")
 
     # Store final scores in dataframe
     batch_scores = pd.DataFrame({
