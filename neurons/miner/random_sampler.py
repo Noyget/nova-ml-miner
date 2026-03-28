@@ -338,7 +338,19 @@ def run_sampler(n_samples: int = 1000,
 
     rxn_ids = [reactions[i][0] for i in range(len(reactions))]
 
-    rxn_id = int(subnet_config["allowed_reaction"].split(":")[-1])
+    # Handle both "allowed_reaction" (mainnet) and "random_valid_reaction" (testnet)
+    if "allowed_reaction" in subnet_config:
+        rxn_id = int(subnet_config["allowed_reaction"].split(":")[-1])
+    elif subnet_config.get("random_valid_reaction", False):
+        # Pick a random reaction from available ones
+        import random
+        if seed is not None:
+            random.seed(seed)
+        rxn_id = random.choice(rxn_ids)
+    else:
+        # Default to first available reaction
+        rxn_id = rxn_ids[0]
+    
     bt.logging.info(f"Generating {n_samples} random molecules for reaction {rxn_id}")
 
     # Generate molecules with validation in batches for efficiency

@@ -5,6 +5,8 @@ import sys
 import json
 import traceback
 import time
+import gc
+import psutil
 
 import bittensor as bt
 import pandas as pd
@@ -17,7 +19,8 @@ sys.path.append(PARENT_DIR)
 
 from validator.scoring import score_molecules_json
 import validator.scoring as scoring_module
-from random_sampler import run_sampler
+from PSICHIC.wrapper import PsichicWrapper
+from .random_sampler import run_sampler
 from combinatorial_db.reactions import get_smiles_from_reaction
 
 #DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
@@ -47,12 +50,33 @@ def iterative_sampling_loop(
       4) Write top x to file (overwrite) each iteration
     """
     n_samples = config["num_molecules"] * 5
+    MAX_MEMORY_MB = 2048
+    GC_INTERVAL = 10  # Aggressive GC every 10 iterations (was 50)
+
+    # Initialize PSICHIC once — keeps model in memory across all iterations
+    # (scoring.py destroys it after each call; we override the global here)
+    bt.logging.info("[Miner] Initializing PSICHIC model (once for full cycle)...")
+    scoring_module.psichic = PsichicWrapper()
+    bt.logging.info("[Miner] PSICHIC model ready.")
 
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
 
     iteration = 0
     while True:
         iteration += 1
+        
+        # Memory check & GC every N iterations
+        if iteration % GC_INTERVAL == 0:
+            gc.collect()
+            try:
+                mem_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+                bt.logging.info(f"[Miner] Memory: {mem_mb:.1f}MB")
+                if mem_mb > MAX_MEMORY_MB:
+                    bt.logging.warning(f"[Miner] Memory exceeded {MAX_MEMORY_MB}MB — forcing GC")
+                    gc.collect()
+            except:
+                pass
+        
         bt.logging.info(f"[Miner] Iteration {iteration}: sampling {n_samples} molecules")
 
         sampler_data = run_sampler(n_samples=n_samples, 
@@ -67,8 +91,8 @@ def iterative_sampling_loop(
             continue
 
         score_dict = score_molecules_json(sampler_file_path, 
-                                         config["target_sequences"], 
-                                         config["antitarget_sequences"], 
+                                         list(config["target_sequences"].keys()), 
+                                         list(config["antitarget_sequences"].keys()), 
                                          config)
         
         if not score_dict:
@@ -76,7 +100,12 @@ def iterative_sampling_loop(
             continue
 
         # Calculate final scores per molecule
-        batch_scores = calculate_final_scores(score_dict, sampler_data, config, save_all_scores)
+        batch_scores = calculate_final_scores(score_dict, sampler_data, config, save_all_scores, iteration)
+        
+        # Explicit cleanup: clear stale references after scoring
+        del score_dict
+        del sampler_data
+        gc.collect()
 
         # Merge, deduplicate, sort and take top x
         top_pool = pd.concat([top_pool, batch_scores])
@@ -93,6 +122,10 @@ def iterative_sampling_loop(
 
         bt.logging.info(f"[Miner] Wrote {config['num_molecules']} top molecules to {output_path}")
         bt.logging.info(f"[Miner] Average score: {top_pool['score'].mean()}")
+        
+        # Explicit cleanup: clear batch data after writing
+        del batch_scores
+        gc.collect()
 
 def calculate_final_scores(score_dict: dict, 
         sampler_data: dict, 
@@ -141,27 +174,19 @@ def calculate_final_scores(score_dict: dict,
         "score": final_scores
     })
 
-    if save_all_scores:
-        all_scores = {"scored_molecules": [(mol["name"], mol["score"]) for mol in batch_scores.to_dict(orient="records")]}
-        
-        if os.path.exists(os.path.join(BASE_DIR, f"all_scores_{current_epoch}.json")):
-            with open(os.path.join(BASE_DIR, f"all_scores_{current_epoch}.json"), "r") as f:
-                all_previous_scores = json.load(f)
-            
-            all_scores["scored_molecules"] = all_previous_scores["scored_molecules"] + all_scores["scored_molecules"]
-
-        with open(os.path.join(BASE_DIR, f"all_scores_{current_epoch}.json"), "w") as f:
-            json.dump(all_scores, f, ensure_ascii=False, indent=2)
+    # NOTE: save_all_scores disabled — /workspace is read-only in Docker sandbox
+    # Writing debug files there crashes the miner. Scores are tracked in top_pool instead.
 
     return batch_scores
 
 def main(config: dict):
+    # Use /tmp for intermediate files — /workspace is read-only in Docker sandbox
     iterative_sampling_loop(
         db_path=DB_PATH,
-        sampler_file_path=os.path.join(BASE_DIR, "sampler_file.json"),
-        output_path=os.path.join(BASE_DIR, "output.json"),
+        sampler_file_path="/tmp/sampler_file.json",
+        output_path=os.environ.get('NOVA_OUTPUT_PATH', '/output/result.json'),
         config=config,
-        save_all_scores=True,
+        save_all_scores=False,
     )
  
 
