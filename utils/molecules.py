@@ -10,7 +10,7 @@ sys.path.append(PARENT_DIR)
 import numpy as np
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import MACCSkeys
+from rdkit.Chem import MACCSkeys, Descriptors
 from huggingface_hub import hf_hub_download, hf_hub_url, get_hf_file_metadata
 from huggingface_hub.errors import EntryNotFoundError
 import bittensor as bt
@@ -50,27 +50,16 @@ def get_smiles(product_name):
 def get_heavy_atom_count(smiles: str) -> int:
     """
     Calculate the number of heavy atoms in a molecule from its SMILES string.
+    Uses RDKit for accurate parsing instead of manual SMILES string analysis.
     """
-    count = 0
-    i = 0
-    while i < len(smiles):
-        c = smiles[i]
-        
-        if c.isalpha() and c.isupper():
-            elem_symbol = c
-            
-            # If the next character is a lowercase letter, include it (e.g., 'Cl', 'Br')
-            if i + 1 < len(smiles) and smiles[i + 1].islower():
-                elem_symbol += smiles[i + 1]
-                i += 1 
-            
-            # If it's not 'H', count it as a heavy atom
-            if elem_symbol != 'H':
-                count += 1
-        
-        i += 1
-    
-    return count
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return 0
+        return Descriptors.HeavyAtomCount(mol)
+    except Exception as e:
+        bt.logging.warning(f"Error calculating heavy atom count for {smiles}: {e}")
+        return 0
 
 
 def compute_maccs_entropy(smiles_list: list[str]) -> float:

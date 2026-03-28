@@ -116,11 +116,30 @@ def iterative_sampling_loop(
         # format to accepted format
         top_entries = {"molecules": top_pool["name"].tolist()}
 
-        # write to file
-        with open(output_path, "w") as f:
-            json.dump(top_entries, f, ensure_ascii=False, indent=2)
-
-        bt.logging.info(f"[Miner] Wrote {config['num_molecules']} top molecules to {output_path}")
+        # write to file (atomic write to prevent corruption on timeout)
+        try:
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            
+            # Write to temporary file first, then rename (atomic on POSIX)
+            import tempfile
+            temp_fd, temp_path = tempfile.mkstemp(dir=output_dir or None)
+            try:
+                with os.fdopen(temp_fd, 'w') as f:
+                    json.dump(top_entries, f, ensure_ascii=False, indent=2)
+                # Atomic rename
+                import shutil
+                shutil.move(temp_path, output_path)
+            except:
+                os.close(temp_fd)
+                os.unlink(temp_path)
+                raise
+            
+            bt.logging.info(f"[Miner] Wrote {config['num_molecules']} top molecules to {output_path}")
+        except Exception as e:
+            bt.logging.error(f"[Miner] Error writing output to {output_path}: {e}")
+            raise
         bt.logging.info(f"[Miner] Average score: {top_pool['score'].mean()}")
         
         # Explicit cleanup: clear batch data after writing
