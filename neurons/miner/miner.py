@@ -17,11 +17,29 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(PARENT_DIR)
 
-from validator.scoring import score_molecules_json
-import validator.scoring as scoring_module
-from PSICHIC.wrapper import PsichicWrapper
 from .random_sampler import run_sampler
 from combinatorial_db.reactions import get_smiles_from_reaction
+
+# Lazy import scoring to avoid memory spike during startup
+# Will be imported only if needed (scoring enabled in config)
+_scoring_loaded = False
+_psichic_wrapper = None
+
+def _load_scoring_module():
+    """Lazy load scoring module only when needed"""
+    global _scoring_loaded, _psichic_wrapper
+    if _scoring_loaded:
+        return
+    
+    try:
+        from validator.scoring import score_molecules_json
+        from PSICHIC.wrapper import PsichicWrapper
+        _psichic_wrapper = PsichicWrapper()
+        _scoring_loaded = True
+        bt.logging.info("Scoring module loaded successfully")
+    except Exception as e:
+        bt.logging.error(f"Failed to load scoring module: {e}")
+        _scoring_loaded = True  # Don't retry
 
 #DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 DB_PATH = str(Path(PARENT_DIR).resolve().parent / "combinatorial_db" / "molecules.sqlite")
@@ -51,13 +69,18 @@ def iterative_sampling_loop(
     """
     n_samples = config["num_molecules"] * 5
     MAX_MEMORY_MB = 2048
-    GC_INTERVAL = 10  # Aggressive GC every 10 iterations (was 50)
+    GC_INTERVAL = 50  # Run GC every 50 iterations (optimized)
 
-    # Initialize PSICHIC once — keeps model in memory across all iterations
-    # (scoring.py destroys it after each call; we override the global here)
-    bt.logging.info("[Miner] Initializing PSICHIC model (once for full cycle)...")
-    scoring_module.psichic = PsichicWrapper()
-    bt.logging.info("[Miner] PSICHIC model ready.")
+    # Lazy-load PSICHIC only if scoring is enabled in config
+    if config.get("enable_scoring", False):
+        bt.logging.info("[Miner] Initializing PSICHIC model (once for full cycle)...")
+        _load_scoring_module()
+        if _scoring_loaded:
+            import validator.scoring as scoring_module
+            scoring_module.psichic = _psichic_wrapper
+            bt.logging.info("[Miner] PSICHIC model ready.")
+    else:
+        bt.logging.info("[Miner] Scoring disabled (testnet mode)")
 
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
 
@@ -90,10 +113,16 @@ def iterative_sampling_loop(
             bt.logging.warning("[Miner] No valid molecules produced; continuing")
             continue
 
-        score_dict = score_molecules_json(sampler_file_path, 
-                                         list(config["target_sequences"].keys()), 
-                                         list(config["antitarget_sequences"].keys()), 
-                                         config)
+        # Skip scoring if module not loaded (testnet mode)
+        if not _scoring_loaded:
+            bt.logging.warning("[Miner] Scoring module not available; using default scores")
+            score_dict = {name: 0.5 for name in sampler_data.get("molecules", [])}
+        else:
+            from validator.scoring import score_molecules_json
+            score_dict = score_molecules_json(sampler_file_path, 
+                                             list(config["target_sequences"].keys()), 
+                                             list(config["antitarget_sequences"].keys()), 
+                                             config)
         
         if not score_dict:
             bt.logging.warning("[Miner] Scoring failed or mismatched; continuing")
