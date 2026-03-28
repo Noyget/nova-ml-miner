@@ -1,36 +1,83 @@
 import sqlite3
 import os
+import time
 from rdkit import Chem
 from rdkit.Chem import AllChem
 import bittensor as bt
 
 def get_reaction_info(rxn_id: int, db_path: str) -> tuple:
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
-        cursor = conn.cursor()
-        cursor.execute("SELECT smarts, roleA, roleB, roleC FROM reactions WHERE rxn_id = ?", (rxn_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result
-    except Exception as e:
-        bt.logging.error(f"Error getting reaction info: {e}")
-        return None
+    """
+    Get reaction info with retry logic for database locks.
+    """
+    max_retries = 3
+    retry_delays = [0.5, 1.0, 2.0]  # Exponential backoff: 0.5s, 1s, 2s
+    
+    for attempt in range(max_retries):
+        try:
+            # Set timeout to 30s and busy timeout to 10s
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True, timeout=30)
+            conn.execute("PRAGMA busy_timeout = 10000")  # 10 seconds
+            cursor = conn.cursor()
+            cursor.execute("SELECT smarts, roleA, roleB, roleC FROM reactions WHERE rxn_id = ?", (rxn_id,))
+            result = cursor.fetchone()
+            conn.close()
+            return result
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) or "disk I/O error" in str(e):
+                if attempt < max_retries - 1:
+                    bt.logging.warning(f"Database locked (attempt {attempt + 1}/{max_retries}), retrying in {retry_delays[attempt]}s...")
+                    time.sleep(retry_delays[attempt])
+                    continue
+                else:
+                    bt.logging.error(f"Database locked after {max_retries} retries: {e}")
+                    return None
+            else:
+                bt.logging.error(f"Error getting reaction info: {e}")
+                return None
+        except Exception as e:
+            bt.logging.error(f"Unexpected error getting reaction info: {e}")
+            return None
+    
+    return None
 
 
 def get_molecules(mol_ids: list, db_path: str) -> list:
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
-        cursor = conn.cursor()
-        molecules = []
-        for mol_id in mol_ids:
-            cursor.execute("SELECT smiles, role_mask FROM molecules WHERE mol_id = ?", (mol_id,))
-            result = cursor.fetchone()
-            molecules.append(result)
-        conn.close()
-        return molecules
-    except Exception as e:
-        bt.logging.error(f"Error getting molecules: {e}")
-        return [None] * len(mol_ids)
+    """
+    Get molecules with retry logic for database locks.
+    """
+    max_retries = 3
+    retry_delays = [0.5, 1.0, 2.0]  # Exponential backoff
+    
+    for attempt in range(max_retries):
+        try:
+            # Set timeout to 30s and busy timeout to 10s
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True, timeout=30)
+            conn.execute("PRAGMA busy_timeout = 10000")  # 10 seconds
+            cursor = conn.cursor()
+            molecules = []
+            for mol_id in mol_ids:
+                cursor.execute("SELECT smiles, role_mask FROM molecules WHERE mol_id = ?", (mol_id,))
+                result = cursor.fetchone()
+                molecules.append(result)
+            conn.close()
+            return molecules
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) or "disk I/O error" in str(e):
+                if attempt < max_retries - 1:
+                    bt.logging.warning(f"Database locked (attempt {attempt + 1}/{max_retries}), retrying in {retry_delays[attempt]}s...")
+                    time.sleep(retry_delays[attempt])
+                    continue
+                else:
+                    bt.logging.error(f"Database locked after {max_retries} retries: {e}")
+                    return [None] * len(mol_ids)
+            else:
+                bt.logging.error(f"Error getting molecules: {e}")
+                return [None] * len(mol_ids)
+        except Exception as e:
+            bt.logging.error(f"Unexpected error getting molecules: {e}")
+            return [None] * len(mol_ids)
+    
+    return [None] * len(mol_ids)
     
 def combine_triazole_synthons(azide_smiles: str, alkyne_smiles: str) -> str:
     """Combine azide and alkyne synthons to form triazole."""
