@@ -12,4 +12,11 @@ __pycache__
 debug/
 artifacts/
 miner_runs_old/
-scripts/
+scripts/neurons/all_scores_*.json
+neurons/sampler_file.json
+sampler_file.json
+combinatorial_db/molecules.sqlite-shm
+combinatorial_db/molecules.sqlite-wal
+*.sqlite-shm
+*.sqlite-wal
+nova-miner.log
